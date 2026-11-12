@@ -1,0 +1,11 @@
+{
+  "name": "Chime Meet",
+  "description": "Small-group video meeting workspace powered by Amazon Chime SDK.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
