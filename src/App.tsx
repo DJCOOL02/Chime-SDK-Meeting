@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ConsoleLogger,
   DefaultDeviceController,
@@ -16,10 +16,12 @@ import {
 } from "amazon-chime-sdk-js";
 import {
   AlertCircle,
+  Calendar,
   CalendarPlus,
   Camera,
   CameraOff,
   Check,
+  Clock,
   Copy,
   Link2,
   LogIn,
@@ -35,6 +37,7 @@ import {
   Users,
   Video,
   X,
+  Zap,
 } from "lucide-react";
 
 const API_URL =
@@ -65,11 +68,12 @@ interface MeetingItem {
   id: string;
   title: string;
   roomCode: string;
+  scheduledTime: string; // ISO datetime-local string or ""
   createdAt: string;
   members: MemberInvite[];
 }
 
-const STORAGE_KEY = "chime_meet_saved_meetings_v1";
+const STORAGE_KEY = "chime_meet_saved_meetings_v2";
 
 function generateMeetingCode(): string {
   const chars = "abcdefghijkmnpqrstuvwxyz23456789";
@@ -81,7 +85,9 @@ function generateMeetingCode(): string {
 }
 
 function buildMeetingLink(roomCode: string): string {
-  if (typeof window === "undefined") return `?room=${encodeURIComponent(roomCode)}`;
+  if (typeof window === "undefined") {
+    return `?room=${encodeURIComponent(roomCode)}`;
+  }
   return `${window.location.origin}${window.location.pathname}?room=${encodeURIComponent(
     roomCode.trim()
   )}`;
@@ -91,16 +97,22 @@ function extractRoomCodeFromInput(input: string): string {
   const trimmed = input.trim();
   if (!trimmed) return "";
   try {
-    if (trimmed.includes("?room=") || trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+    if (
+      trimmed.includes("?room=") ||
+      trimmed.includes("&room=") ||
+      trimmed.startsWith("http://") ||
+      trimmed.startsWith("https://")
+    ) {
       const url = new URL(
-        trimmed.startsWith("http") ? trimmed : `https://example.com/${trimmed}`
+        trimmed.startsWith("http")
+          ? trimmed
+          : `https://example.com/${trimmed.replace(/^\//, "")}`
       );
       const roomParam = url.searchParams.get("room")?.trim();
       if (roomParam) return roomParam;
     }
   } catch {
-    // Fallback to regex extraction if URL parsing fails
-    const match = trimmed.match(/[?&]room=([^&#]+)/);
+    const match = trimmed.match(/[?&]room=([^&#\s]+)/);
     if (match?.[1]) {
       return decodeURIComponent(match[1].trim());
     }
@@ -123,11 +135,28 @@ function formatExternalUserId(
   return "Remote Attendee";
 }
 
-function getInitialRoomFromUrl(): string {
+function getRoomFromUrl(): string {
   if (typeof window === "undefined") return "";
   const params = new URLSearchParams(window.location.search);
   const roomParam = params.get("room")?.trim();
   return roomParam || "";
+}
+
+function formatScheduledTime(isoValue: string): string {
+  if (!isoValue) return "Instant / Anytime";
+  try {
+    const d = new Date(isoValue);
+    if (Number.isNaN(d.getTime())) return isoValue;
+    return d.toLocaleString([], {
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return isoValue;
+  }
 }
 
 function isValidEmail(email: string): boolean {
@@ -135,16 +164,19 @@ function isValidEmail(email: string): boolean {
 }
 
 export default function App() {
-  // Initial room from ?room= query param if present, otherwise generate a fresh code
-  const [roomName, setRoomName] = useState<string>(() => {
-    const fromUrl = getInitialRoomFromUrl();
-    return fromUrl || generateMeetingCode();
-  });
+  const initialUrlRoom = getRoomFromUrl();
+
+  const [roomName, setRoomName] = useState<string>(
+    initialUrlRoom || "test"
+  );
   const [userName, setUserName] = useState<string>("guest");
   const [status, setStatus] = useState<ConnectionStatus>("Idle");
   const [errorText, setErrorText] = useState<string>("");
   const [activeMeetingId, setActiveMeetingId] = useState<string>("");
   const [copiedRoomCode, setCopiedRoomCode] = useState<string | null>(null);
+  const [inMeetingView, setInMeetingView] = useState<boolean>(
+    Boolean(initialUrlRoom)
+  );
 
   // Single-email invite inside active room bar
   const [inviteEmail, setInviteEmail] = useState<string>("");
@@ -152,7 +184,7 @@ export default function App() {
   const [inviteSuccess, setInviteSuccess] = useState<string>("");
   const [inviteError, setInviteError] = useState<string>("");
 
-  // Multiple meetings creator state
+  // Multiple meetings creator & scheduler state
   const [meetings, setMeetings] = useState<MeetingItem[]>(() => {
     if (typeof window === "undefined") return [];
     try {
@@ -171,6 +203,7 @@ export default function App() {
   const [newMeetingCode, setNewMeetingCode] = useState<string>(() =>
     generateMeetingCode()
   );
+  const [newMeetingTime, setNewMeetingTime] = useState<string>("");
   const [newMemberInput, setNewMemberInput] = useState<string>("");
   const [draftMembers, setDraftMembers] = useState<string[]>([]);
   const [creatorFeedback, setCreatorFeedback] = useState<{
@@ -189,7 +222,7 @@ export default function App() {
 
   // Chime media states
   const [isMuted, setIsMuted] = useState<boolean>(false);
-  const [isCameraOn, setIsCameraOn] = useState<boolean>(true);
+  const [isCameraOn, setIsCameraOn] = useState<boolean>(false);
   const [tiles, setTiles] = useState<TileItem[]>([]);
   const [attendees, setAttendees] = useState<Record<string, AttendeePresence>>(
     {}
@@ -201,7 +234,10 @@ export default function App() {
   const audioElementRef = useRef<HTMLAudioElement | null>(null);
   const videoElementsMapRef = useRef<Map<number, HTMLVideoElement>>(new Map());
   const activeCameraIdRef = useRef<string | null>(null);
+  const activeMicIdRef = useRef<string | null>(null);
   const localAttendeeIdRef = useRef<string | null>(null);
+  const autoJoinedUrlRoomRef = useRef<boolean>(false);
+  const meetingStageRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     try {
@@ -211,7 +247,7 @@ export default function App() {
     }
   }, [meetings]);
 
-  const cleanupMeeting = async (nextStatus?: ConnectionStatus) => {
+  const cleanupMeeting = useCallback(async (nextStatus?: ConnectionStatus) => {
     const av = audioVideoRef.current;
     if (av) {
       try {
@@ -253,28 +289,356 @@ export default function App() {
     audioVideoRef.current = null;
     sessionRef.current = null;
     activeCameraIdRef.current = null;
+    activeMicIdRef.current = null;
     localAttendeeIdRef.current = null;
 
     setTiles([]);
     setAttendees({});
     setActiveMeetingId("");
     setIsMuted(false);
-    setIsCameraOn(true);
+    setIsCameraOn(false);
     if (nextStatus) {
       setStatus(nextStatus);
     }
-  };
+  }, []);
 
+  const joinRoomByCode = useCallback(
+    async (targetRoomRaw: string, customUserName?: string) => {
+      const trimmedRoom = extractRoomCodeFromInput(targetRoomRaw) || "test";
+      const trimmedUser = (customUserName ?? userName).trim() || "guest";
+
+      setRoomName(trimmedRoom);
+      setInMeetingView(true);
+      setErrorText("");
+      setStatus("Joining");
+
+      // Scroll meeting room stage into view smoothly
+      setTimeout(() => {
+        meetingStageRef.current?.scrollIntoView({
+          behavior: "smooth",
+          block: "start",
+        });
+      }, 50);
+
+      try {
+        await cleanupMeeting();
+        setStatus("Joining");
+
+        try {
+          const url = new URL(window.location.href);
+          url.searchParams.set("room", trimmedRoom);
+          window.history.replaceState({}, "", url.toString());
+        } catch {
+          // Ignore history errors in restricted iframes
+        }
+
+        const response = await fetch(API_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            room: trimmedRoom,
+            user: trimmedUser,
+          }),
+        });
+
+        const rawResponseText = await response.text();
+        let parsed: unknown = rawResponseText;
+
+        try {
+          parsed = JSON.parse(rawResponseText);
+          if (typeof parsed === "string") {
+            parsed = JSON.parse(parsed);
+          }
+        } catch {
+          // Keep rawResponseText so it can be shown as the raw response error below
+        }
+
+        let payload = parsed as Record<string, unknown> | null;
+        if (
+          payload &&
+          typeof payload === "object" &&
+          !payload.Meeting &&
+          typeof payload.body === "string"
+        ) {
+          try {
+            const inner = JSON.parse(payload.body);
+            if (inner && typeof inner === "object") {
+              payload = inner as Record<string, unknown>;
+            }
+          } catch {
+            // Ignore inner parse error
+          }
+        }
+
+        const Meeting = payload?.Meeting as Record<string, unknown> | undefined;
+        const Attendee = payload?.Attendee as
+          | Record<string, unknown>
+          | undefined;
+
+        if (!Meeting || !Attendee) {
+          setStatus("Error");
+          setErrorText(
+            rawResponseText ||
+              JSON.stringify(parsed, null, 2) ||
+              "Invalid server response: missing Meeting or Attendee."
+          );
+          return;
+        }
+
+        localAttendeeIdRef.current =
+          typeof Attendee.AttendeeId === "string" ? Attendee.AttendeeId : null;
+        setActiveMeetingId(
+          typeof Meeting.MeetingId === "string" ? Meeting.MeetingId : ""
+        );
+
+        // Request browser permissions beforehand if possible, without blocking meeting join if denied/busy
+        if (navigator.mediaDevices?.getUserMedia) {
+          try {
+            const permStream = await navigator.mediaDevices.getUserMedia({
+              audio: true,
+              video: true,
+            });
+            permStream.getTracks().forEach((track) => track.stop());
+          } catch {
+            try {
+              const audioPermStream = await navigator.mediaDevices.getUserMedia(
+                {
+                  audio: true,
+                }
+              );
+              audioPermStream.getTracks().forEach((track) => track.stop());
+            } catch {
+              // Continue so the user still enters the meeting room even if permissions need a button click
+            }
+          }
+        }
+
+        // Remove EventIngestionUrl and TenantIds array from Meeting payload so Chime SDK's
+        // internal EventReporter does not throw "TypeError: Unhandled type received while flattening attributes"
+        const sanitizedMeeting = { ...Meeting };
+        delete sanitizedMeeting.TenantIds;
+        if (
+          sanitizedMeeting.MediaPlacement &&
+          typeof sanitizedMeeting.MediaPlacement === "object"
+        ) {
+          const placement = {
+            ...(sanitizedMeeting.MediaPlacement as Record<string, unknown>),
+          };
+          delete placement.EventIngestionUrl;
+          sanitizedMeeting.MediaPlacement = placement;
+        }
+
+        const logger = new ConsoleLogger("Chime", LogLevel.OFF);
+        const config = new MeetingSessionConfiguration(
+          sanitizedMeeting,
+          Attendee
+        );
+        config.connectionTimeoutMs = 30000;
+        const session = new DefaultMeetingSession(
+          config,
+          logger,
+          new DefaultDeviceController(logger)
+        );
+        const audioVideo = session.audioVideo;
+
+        sessionRef.current = session;
+        audioVideoRef.current = audioVideo;
+
+        const mics = await audioVideo.listAudioInputDevices();
+        const cams = await audioVideo.listVideoInputDevices();
+
+        if (!mics || mics.length === 0 || !cams || cams.length === 0) {
+          const missing: string[] = [];
+          if (!mics || mics.length === 0) missing.push("microphone");
+          if (!cams || cams.length === 0) missing.push("camera");
+          await cleanupMeeting("Error");
+          setErrorText(
+            `No ${missing.join(
+              " or "
+            )} input devices found. Please connect a microphone and camera, allow permissions, and click Join.`
+          );
+          return;
+        }
+
+        // Start microphone input
+        const micDeviceId = mics[0]?.deviceId || "default";
+        activeMicIdRef.current = micDeviceId;
+        try {
+          await audioVideo.startAudioInput(micDeviceId);
+          setIsMuted(false);
+        } catch {
+          setIsMuted(true);
+        }
+
+        // Start camera input if deviceId is available and not locked
+        let localVideoStarted = false;
+        const camDeviceId = cams[0]?.deviceId;
+        if (camDeviceId) {
+          activeCameraIdRef.current = camDeviceId;
+          try {
+            await audioVideo.startVideoInput(camDeviceId);
+            localVideoStarted = true;
+            setIsCameraOn(true);
+          } catch {
+            setIsCameraOn(false);
+          }
+        } else {
+          setIsCameraOn(false);
+        }
+
+        if (audioElementRef.current) {
+          try {
+            await audioVideo.bindAudioElement(audioElementRef.current);
+          } catch {
+            // Ignore audio element bind restriction until user interaction
+          }
+        }
+
+        audioVideo.realtimeSubscribeToAttendeeIdPresence(
+          (presentAttendeeId, present, externalUserId) => {
+            setAttendees((prev) => {
+              const next = { ...prev };
+              if (!present) {
+                delete next[presentAttendeeId];
+              } else {
+                const isSelf = presentAttendeeId === localAttendeeIdRef.current;
+                next[presentAttendeeId] = {
+                  attendeeId: presentAttendeeId,
+                  externalUserId: externalUserId || "",
+                  label: isSelf
+                    ? "You"
+                    : formatExternalUserId(externalUserId, presentAttendeeId),
+                };
+              }
+              return next;
+            });
+          }
+        );
+
+        const observer: AudioVideoObserver = {
+          audioVideoDidStart: () => {
+            setStatus("Connected");
+            if (localVideoStarted) {
+              audioVideo.startLocalVideoTile();
+            }
+          },
+          audioVideoDidStop: (sessionStatus) => {
+            const statusCode = sessionStatus?.statusCode?.();
+            setTiles([]);
+            setAttendees({});
+            if (sessionStatus?.isFailure?.()) {
+              void cleanupMeeting("Error");
+              setErrorText(
+                `Meeting connection closed or expired (code ${statusCode}). Click "Join" to reconnect to this meeting room.`
+              );
+            } else {
+              setStatus((prev) => (prev === "Error" ? "Error" : "Idle"));
+            }
+          },
+          videoTileDidUpdate: (tileState: VideoTileState) => {
+            if (
+              tileState.tileId === null ||
+              tileState.isContent ||
+              !tileState.boundAttendeeId
+            ) {
+              return;
+            }
+
+            const tileId = tileState.tileId;
+            const isLocal = Boolean(tileState.localTile);
+            const attendeeId = tileState.boundAttendeeId;
+            const label = isLocal
+              ? "You"
+              : formatExternalUserId(
+                  tileState.boundExternalUserId,
+                  tileState.boundAttendeeId
+                );
+
+            setTiles((prev) => {
+              const existingByTileIdx = prev.findIndex(
+                (t) => t.tileId === tileId || t.attendeeId === attendeeId
+              );
+              if (existingByTileIdx !== -1) {
+                const updated = [...prev];
+                updated[existingByTileIdx] = {
+                  tileId,
+                  isLocal,
+                  attendeeId,
+                  label,
+                };
+                return updated;
+              }
+
+              if (prev.length >= 4) {
+                if (isLocal) {
+                  return [
+                    { tileId, isLocal, attendeeId, label },
+                    ...prev.slice(0, 3),
+                  ];
+                }
+                return prev;
+              }
+
+              const next = [...prev, { tileId, isLocal, attendeeId, label }];
+              next.sort((a, b) =>
+                a.isLocal === b.isLocal
+                  ? a.tileId - b.tileId
+                  : a.isLocal
+                  ? -1
+                  : 1
+              );
+              return next;
+            });
+
+            const existingVideoEl = videoElementsMapRef.current.get(tileId);
+            if (existingVideoEl) {
+              audioVideo.bindVideoElement(tileId, existingVideoEl);
+            }
+          },
+          videoTileWasRemoved: (tileId: number) => {
+            videoElementsMapRef.current.delete(tileId);
+            setTiles((prev) => prev.filter((t) => t.tileId !== tileId));
+          },
+        };
+
+        observerRef.current = observer;
+        audioVideo.addObserver(observer);
+
+        audioVideo.start();
+      } catch (err: unknown) {
+        await cleanupMeeting("Error");
+        const message =
+          err instanceof Error
+            ? `${err.name}: ${err.message}${err.stack ? `\n${err.stack}` : ""}`
+            : typeof err === "string"
+            ? err
+            : JSON.stringify(err, null, 2);
+        setErrorText(
+          message || "An unexpected error occurred while joining the meeting."
+        );
+      }
+    },
+    [cleanupMeeting, userName]
+  );
+
+  // When page loads with ?room=<code_from_link>, auto-fill AND automatically enter & connect to that meeting room
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    const roomParam = params.get("room");
-    if (roomParam && roomParam.trim()) {
-      setRoomName(roomParam.trim());
+    const roomParam = params.get("room")?.trim();
+    if (roomParam) {
+      setRoomName(roomParam);
+      setInMeetingView(true);
+      if (!autoJoinedUrlRoomRef.current) {
+        autoJoinedUrlRoomRef.current = true;
+        void joinRoomByCode(roomParam, "guest");
+      }
     }
     return () => {
       void cleanupMeeting();
     };
-  }, []);
+  }, [cleanupMeeting, joinRoomByCode]);
 
   // Helper to send a single email invite via API_URL
   const sendInviteRequest = async (
@@ -348,7 +712,7 @@ export default function App() {
     }
   };
 
-  // Single email invite handler (kept for direct invite section)
+  // Single email invite handler
   const handleSendInvite = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (inviteSending) return;
@@ -375,13 +739,30 @@ export default function App() {
     }
   };
 
+  // Start an instant meeting immediately in one click
+  const handleStartInstantMeeting = async () => {
+    const instantCode = generateMeetingCode();
+    const newInstantMeeting: MeetingItem = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      title: `Instant Meeting (${instantCode})`,
+      roomCode: instantCode,
+      scheduledTime: "",
+      createdAt: new Date().toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      }),
+      members: [],
+    };
+    setMeetings((prev) => [newInstantMeeting, ...prev]);
+    await joinRoomByCode(instantCode);
+  };
+
   // Add member email(s) to the New Meeting draft list
   const handleAddDraftMember = () => {
     setCreatorFeedback(null);
     const raw = newMemberInput.trim();
     if (!raw) return;
 
-    // Support comma or space separated emails
     const candidates = raw
       .split(/[,;\s]+/)
       .map((s) => s.trim().toLowerCase())
@@ -408,13 +789,15 @@ export default function App() {
     setDraftMembers((prev) => prev.filter((item) => item !== emailToRemove));
   };
 
-  // Create a new meeting link & optionally send invites to all added member emails
-  const handleCreateMeeting = async (e: React.FormEvent) => {
+  // Create a new meeting link (with optional scheduled time & member emails)
+  const handleCreateMeeting = async (
+    e: React.FormEvent,
+    joinImmediately = false
+  ) => {
     e.preventDefault();
     if (creatingMeeting) return;
     setCreatorFeedback(null);
 
-    // If user typed an email in the member box but didn't click "+", include it automatically
     let finalMembers = [...draftMembers];
     if (newMemberInput.trim()) {
       const extraCandidates = newMemberInput
@@ -450,6 +833,7 @@ export default function App() {
       id: meetingId,
       title,
       roomCode: code,
+      scheduledTime: newMeetingTime,
       createdAt: new Date().toLocaleTimeString([], {
         hour: "2-digit",
         minute: "2-digit",
@@ -457,70 +841,72 @@ export default function App() {
       members: initialMemberObjects,
     };
 
-    // Add to meetings list immediately (supports multiple simultaneous meetings)
     setMeetings((prev) => [createdMeeting, ...prev]);
 
-    // Also set as current active room if not currently in a call
     if (status !== "Connected" && status !== "Joining") {
       setRoomName(code);
     }
 
-    // Prepare next meeting code for creating another meeting right away
     setNewMeetingTitle("");
+    setNewMeetingTime("");
     setNewMeetingCode(generateMeetingCode());
     setDraftMembers([]);
 
-    if (finalMembers.length === 0) {
-      setCreatorFeedback({
-        type: "success",
-        text: `Meeting link created (${code}). Ready to share or join!`,
-      });
-      return;
-    }
+    if (finalMembers.length > 0) {
+      setCreatingMeeting(true);
+      const results = await Promise.all(
+        finalMembers.map(async (email) => {
+          const res = await sendInviteRequest(email, code, userName);
+          return { email, ...res };
+        })
+      );
+      setCreatingMeeting(false);
 
-    // Send invites to all members concurrently
-    setCreatingMeeting(true);
-    const results = await Promise.all(
-      finalMembers.map(async (email) => {
-        const res = await sendInviteRequest(email, code, userName);
-        return { email, ...res };
-      })
-    );
-    setCreatingMeeting(false);
+      const sentCount = results.filter((r) => r.ok).length;
+      const failed = results.filter((r) => !r.ok);
 
-    const sentCount = results.filter((r) => r.ok).length;
-    const failed = results.filter((r) => !r.ok);
+      setMeetings((prev) =>
+        prev.map((m) => {
+          if (m.id !== meetingId) return m;
+          return {
+            ...m,
+            members: m.members.map((mem) => {
+              const match = results.find((r) => r.email === mem.email);
+              if (!match) return mem;
+              return {
+                email: mem.email,
+                status: match.ok ? "sent" : "error",
+                errorMessage: match.error,
+              };
+            }),
+          };
+        })
+      );
 
-    setMeetings((prev) =>
-      prev.map((m) => {
-        if (m.id !== meetingId) return m;
-        return {
-          ...m,
-          members: m.members.map((mem) => {
-            const match = results.find((r) => r.email === mem.email);
-            if (!match) return mem;
-            return {
-              email: mem.email,
-              status: match.ok ? "sent" : "error",
-              errorMessage: match.error,
-            };
-          }),
-        };
-      })
-    );
-
-    if (failed.length === 0) {
-      setCreatorFeedback({
-        type: "success",
-        text: `Invite sent to ${sentCount} member${sentCount === 1 ? "" : "s"} for meeting ${code}`,
-      });
+      if (failed.length === 0) {
+        setCreatorFeedback({
+          type: "success",
+          text: `Invite sent (${sentCount} member${
+            sentCount === 1 ? "" : "s"
+          }) for meeting ${code}`,
+        });
+      } else {
+        setCreatorFeedback({
+          type: "error",
+          text:
+            failed[0].error ||
+            `Sent ${sentCount}/${finalMembers.length} invites. Some failed.`,
+        });
+      }
     } else {
       setCreatorFeedback({
-        type: "error",
-        text:
-          failed[0].error ||
-          `Sent ${sentCount}/${finalMembers.length} invites. Some failed.`,
+        type: "success",
+        text: `Meeting link created (${code}).`,
       });
+    }
+
+    if (joinImmediately) {
+      await joinRoomByCode(code);
     }
   };
 
@@ -550,7 +936,6 @@ export default function App() {
       return;
     }
 
-    // Clear input and mark sending
     setMeetingMemberInputs((prev) => ({ ...prev, [meeting.id]: "" }));
     setMeetingFeedbackMap((prev) => {
       const next = { ...prev };
@@ -636,277 +1021,9 @@ export default function App() {
     }
   };
 
-  const joinRoomByCode = async (targetRoomRaw: string) => {
-    if (status === "Joining") return;
-
-    const trimmedRoom = extractRoomCodeFromInput(targetRoomRaw) || "test";
-    const trimmedUser = userName.trim() || "guest";
-
-    setRoomName(trimmedRoom);
-    setErrorText("");
-    setStatus("Joining");
-
-    try {
-      await cleanupMeeting();
-      setStatus("Joining");
-
-      try {
-        const url = new URL(window.location.href);
-        url.searchParams.set("room", trimmedRoom);
-        window.history.replaceState({}, "", url.toString());
-      } catch {
-        // Ignore history errors in restricted iframes
-      }
-
-      const response = await fetch(API_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          room: trimmedRoom,
-          user: trimmedUser,
-        }),
-      });
-
-      const rawResponseText = await response.text();
-      let parsed: unknown = rawResponseText;
-
-      try {
-        parsed = JSON.parse(rawResponseText);
-        if (typeof parsed === "string") {
-          parsed = JSON.parse(parsed);
-        }
-      } catch {
-        // Keep rawResponseText so it can be shown as the raw response error below
-      }
-
-      let payload = parsed as Record<string, unknown> | null;
-      if (
-        payload &&
-        typeof payload === "object" &&
-        !payload.Meeting &&
-        typeof payload.body === "string"
-      ) {
-        try {
-          const inner = JSON.parse(payload.body);
-          if (inner && typeof inner === "object") {
-            payload = inner as Record<string, unknown>;
-          }
-        } catch {
-          // Ignore inner parse error
-        }
-      }
-
-      const Meeting = payload?.Meeting as Record<string, unknown> | undefined;
-      const Attendee = payload?.Attendee as Record<string, unknown> | undefined;
-
-      if (!Meeting || !Attendee) {
-        setStatus("Error");
-        setErrorText(
-          rawResponseText ||
-            JSON.stringify(parsed, null, 2) ||
-            "Invalid server response: missing Meeting or Attendee."
-        );
-        return;
-      }
-
-      localAttendeeIdRef.current =
-        typeof Attendee.AttendeeId === "string" ? Attendee.AttendeeId : null;
-      setActiveMeetingId(
-        typeof Meeting.MeetingId === "string" ? Meeting.MeetingId : ""
-      );
-
-      if (navigator.mediaDevices?.getUserMedia) {
-        try {
-          const permStream = await navigator.mediaDevices.getUserMedia({
-            audio: true,
-            video: true,
-          });
-          permStream.getTracks().forEach((track) => track.stop());
-        } catch {
-          try {
-            const audioPermStream = await navigator.mediaDevices.getUserMedia({
-              audio: true,
-            });
-            audioPermStream.getTracks().forEach((track) => track.stop());
-          } catch {
-            // Let listAudioInputDevices / listVideoInputDevices handle reporting below
-          }
-        }
-      }
-
-      const logger = new ConsoleLogger("Chime", LogLevel.WARN);
-      const config = new MeetingSessionConfiguration(Meeting, Attendee);
-      const session = new DefaultMeetingSession(
-        config,
-        logger,
-        new DefaultDeviceController(logger)
-      );
-      const audioVideo = session.audioVideo;
-
-      sessionRef.current = session;
-      audioVideoRef.current = audioVideo;
-
-      const mics = await audioVideo.listAudioInputDevices();
-      const cams = await audioVideo.listVideoInputDevices();
-
-      if (!mics || mics.length === 0 || !cams || cams.length === 0) {
-        const missing: string[] = [];
-        if (!mics || mics.length === 0) missing.push("microphone");
-        if (!cams || cams.length === 0) missing.push("camera");
-        await cleanupMeeting("Error");
-        setErrorText(
-          `No ${missing.join(
-            " or "
-          )} input devices found (or browser permissions were blocked). Please allow Camera and Microphone permissions in your browser address bar and try again.`
-        );
-        return;
-      }
-
-      const micDeviceId = mics[0].deviceId || "default";
-      const camDeviceId = cams[0].deviceId;
-      activeCameraIdRef.current = camDeviceId;
-
-      await audioVideo.startAudioInput(micDeviceId);
-
-      let localVideoStarted = false;
-      try {
-        await audioVideo.startVideoInput(camDeviceId);
-        localVideoStarted = true;
-      } catch (camErr: unknown) {
-        setIsCameraOn(false);
-        const camMsg =
-          camErr instanceof Error ? camErr.message : String(camErr);
-        setErrorText(
-          `Joined room without local camera (${camMsg}). Check if your camera is already in use by another browser window or app.`
-        );
-      }
-
-      if (audioElementRef.current) {
-        await audioVideo.bindAudioElement(audioElementRef.current);
-      }
-
-      audioVideo.realtimeSubscribeToAttendeeIdPresence(
-        (presentAttendeeId, present, externalUserId) => {
-          setAttendees((prev) => {
-            const next = { ...prev };
-            if (!present) {
-              delete next[presentAttendeeId];
-            } else {
-              const isSelf = presentAttendeeId === localAttendeeIdRef.current;
-              next[presentAttendeeId] = {
-                attendeeId: presentAttendeeId,
-                externalUserId: externalUserId || "",
-                label: isSelf
-                  ? "You"
-                  : formatExternalUserId(externalUserId, presentAttendeeId),
-              };
-            }
-            return next;
-          });
-        }
-      );
-
-      const observer: AudioVideoObserver = {
-        audioVideoDidStart: () => {
-          setStatus("Connected");
-          if (localVideoStarted) {
-            audioVideo.startLocalVideoTile();
-          }
-        },
-        audioVideoDidStop: () => {
-          setTiles([]);
-          setAttendees({});
-          setStatus((prev) => (prev === "Error" ? "Error" : "Idle"));
-        },
-        videoTileDidUpdate: (tileState: VideoTileState) => {
-          if (
-            tileState.tileId === null ||
-            tileState.isContent ||
-            !tileState.boundAttendeeId
-          ) {
-            return;
-          }
-
-          const tileId = tileState.tileId;
-          const isLocal = Boolean(tileState.localTile);
-          const attendeeId = tileState.boundAttendeeId;
-          const label = isLocal
-            ? "You"
-            : formatExternalUserId(
-                tileState.boundExternalUserId,
-                tileState.boundAttendeeId
-              );
-
-          setTiles((prev) => {
-            const existingByTileIdx = prev.findIndex(
-              (t) => t.tileId === tileId || t.attendeeId === attendeeId
-            );
-            if (existingByTileIdx !== -1) {
-              const updated = [...prev];
-              updated[existingByTileIdx] = {
-                tileId,
-                isLocal,
-                attendeeId,
-                label,
-              };
-              return updated;
-            }
-
-            if (prev.length >= 4) {
-              if (isLocal) {
-                return [
-                  { tileId, isLocal, attendeeId, label },
-                  ...prev.slice(0, 3),
-                ];
-              }
-              return prev;
-            }
-
-            const next = [...prev, { tileId, isLocal, attendeeId, label }];
-            next.sort((a, b) =>
-              a.isLocal === b.isLocal
-                ? a.tileId - b.tileId
-                : a.isLocal
-                ? -1
-                : 1
-            );
-            return next;
-          });
-
-          const existingVideoEl = videoElementsMapRef.current.get(tileId);
-          if (existingVideoEl) {
-            audioVideo.bindVideoElement(tileId, existingVideoEl);
-          }
-        },
-        videoTileWasRemoved: (tileId: number) => {
-          videoElementsMapRef.current.delete(tileId);
-          setTiles((prev) => prev.filter((t) => t.tileId !== tileId));
-        },
-      };
-
-      observerRef.current = observer;
-      audioVideo.addObserver(observer);
-
-      audioVideo.start();
-    } catch (err: unknown) {
-      await cleanupMeeting("Error");
-      const message =
-        err instanceof Error
-          ? `${err.name}: ${err.message}${err.stack ? `\n${err.stack}` : ""}`
-          : typeof err === "string"
-          ? err
-          : JSON.stringify(err, null, 2);
-      setErrorText(
-        message || "An unexpected error occurred while joining the meeting."
-      );
-    }
-  };
-
   const handleJoin = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (status === "Joining" || status === "Connected") return;
+    if (status === "Joining") return;
     await joinRoomByCode(roomName);
   };
 
@@ -915,11 +1032,19 @@ export default function App() {
     await cleanupMeeting("Idle");
   };
 
-  const handleToggleMute = () => {
+  const handleToggleMute = async () => {
     const av = audioVideoRef.current;
     if (!av) return;
 
     if (isMuted) {
+      // Ensure audio input is started in case permissions were granted after initial load
+      try {
+        const mics = await av.listAudioInputDevices();
+        const micId = activeMicIdRef.current || mics[0]?.deviceId || "default";
+        await av.startAudioInput(micId);
+      } catch {
+        // Ignore if already started
+      }
       const unmuted = av.realtimeUnmuteLocalAudio();
       if (unmuted) {
         setIsMuted(false);
@@ -940,13 +1065,19 @@ export default function App() {
         await av.stopVideoInput();
         setIsCameraOn(false);
       } else {
+        if (navigator.mediaDevices?.getUserMedia) {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+          });
+          stream.getTracks().forEach((t) => t.stop());
+        }
         const cams = await av.listVideoInputDevices();
         const deviceId = activeCameraIdRef.current || cams[0]?.deviceId;
         if (!deviceId) {
-          setStatus("Error");
-          setErrorText("No camera device available to restart video.");
+          setErrorText("No camera device available to start video.");
           return;
         }
+        activeCameraIdRef.current = deviceId;
         await av.startVideoInput(deviceId);
         av.startLocalVideoTile();
         setIsCameraOn(true);
@@ -1017,7 +1148,7 @@ export default function App() {
                   className="text-xs text-slate-400 font-mono tabular-nums"
                   title={`AWS Chime Meeting ID: ${activeMeetingId}`}
                 >
-                  Active Meeting: {currentCleanRoom} ({activeMeetingId.slice(0, 8)})
+                  Room: {currentCleanRoom} ({activeMeetingId.slice(0, 8)})
                 </span>
               </>
             )}
@@ -1028,7 +1159,7 @@ export default function App() {
             <div className="flex items-center gap-1.5 text-xs text-slate-400 font-mono tabular-nums">
               <Users className="w-3.5 h-3.5 text-slate-500" />
               <span>
-                {attendeeList.length} connected / {tiles.length} video tiles
+                {attendeeList.length} in room · {tiles.length} / 4 video tiles
               </span>
             </div>
           </div>
@@ -1037,582 +1168,6 @@ export default function App() {
 
       {/* Main Content */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-6 py-6 flex flex-col gap-6">
-        {/* Top Grid: Create Meeting Link + Manage Multiple Meetings */}
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-          {/* Left Column: Create Meeting Link & Invite Members (like Google Meet / MS Teams) */}
-          <section className="lg:col-span-5 rounded-xl border border-slate-800 bg-slate-900/70 p-5">
-            <div className="flex items-center justify-between gap-2 mb-4">
-              <div className="flex items-center gap-2.5">
-                <CalendarPlus className="w-5 h-5 text-indigo-400" />
-                <h2 className="text-base font-semibold text-white">
-                  Create Meeting Link
-                </h2>
-              </div>
-              <span className="text-xs text-slate-400">
-                Multi-room generator
-              </span>
-            </div>
-
-            <form onSubmit={handleCreateMeeting} className="space-y-4">
-              {/* Optional meeting title */}
-              <div>
-                <label
-                  htmlFor="new-meeting-title"
-                  className="block text-xs font-medium text-slate-300 mb-1.5"
-                >
-                  Meeting title
-                </label>
-                <input
-                  id="new-meeting-title"
-                  type="text"
-                  value={newMeetingTitle}
-                  onChange={(e) => setNewMeetingTitle(e.target.value)}
-                  placeholder="e.g. Product Sync, Daily Standup"
-                  className="w-full h-9 px-3 rounded-lg bg-slate-950 border border-slate-800 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-colors"
-                />
-              </div>
-
-              {/* Generated Meeting Link Preview */}
-              <div>
-                <div className="flex items-center justify-between mb-1.5">
-                  <label className="block text-xs font-medium text-slate-300">
-                    Generated meeting link
-                  </label>
-                  <button
-                    type="button"
-                    onClick={() => setNewMeetingCode(generateMeetingCode())}
-                    className="text-xs text-indigo-400 hover:text-indigo-300 inline-flex items-center gap-1 cursor-pointer"
-                  >
-                    <RefreshCw className="w-3 h-3" />
-                    <span>New link</span>
-                  </button>
-                </div>
-                <div className="flex items-center gap-2">
-                  <div className="flex-1 h-9 px-3 rounded-lg bg-slate-950 border border-slate-800 flex items-center gap-2 min-w-0">
-                    <Link2 className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
-                    <span className="text-xs font-mono text-slate-200 truncate">
-                      {buildMeetingLink(newMeetingCode)}
-                    </span>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => handleCopyLinkForRoom(newMeetingCode)}
-                    className="h-9 px-3 rounded-lg border border-slate-800 bg-slate-950 hover:bg-slate-800 text-slate-200 text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
-                  >
-                    {copiedRoomCode === newMeetingCode ? (
-                      <>
-                        <Check className="w-3.5 h-3.5 text-emerald-400" />
-                        <span>Copied</span>
-                      </>
-                    ) : (
-                      <>
-                        <Copy className="w-3.5 h-3.5 text-slate-400" />
-                        <span>Copy</span>
-                      </>
-                    )}
-                  </button>
-                </div>
-              </div>
-
-              {/* Add member emails to this meeting */}
-              <div>
-                <label
-                  htmlFor="add-member-email"
-                  className="block text-xs font-medium text-slate-300 mb-1.5"
-                >
-                  Add member emails (invite participants)
-                </label>
-                <div className="flex items-center gap-2">
-                  <input
-                    id="add-member-email"
-                    type="text"
-                    value={newMemberInput}
-                    onChange={(e) => {
-                      setNewMemberInput(e.target.value);
-                      if (creatorFeedback) setCreatorFeedback(null);
-                    }}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        handleAddDraftMember();
-                      }
-                    }}
-                    placeholder="alice@example.com, bob@example.com"
-                    className="flex-1 h-9 px-3 rounded-lg bg-slate-950 border border-slate-800 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-colors"
-                  />
-                  <button
-                    type="button"
-                    onClick={handleAddDraftMember}
-                    className="h-9 px-3 rounded-lg border border-slate-800 bg-slate-950 hover:bg-slate-800 text-slate-200 text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
-                  >
-                    <UserPlus className="w-3.5 h-3.5 text-indigo-400" />
-                    <span>Add</span>
-                  </button>
-                </div>
-
-                {/* Added member list */}
-                {draftMembers.length > 0 && (
-                  <div className="mt-2.5 flex flex-wrap gap-1.5">
-                    {draftMembers.map((email) => (
-                      <div
-                        key={email}
-                        className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-950 border border-slate-800 text-xs text-slate-200"
-                      >
-                        <Mail className="w-3 h-3 text-slate-400" />
-                        <span>{email}</span>
-                        <button
-                          type="button"
-                          onClick={() => handleRemoveDraftMember(email)}
-                          className="text-slate-500 hover:text-rose-400 cursor-pointer"
-                          aria-label={`Remove ${email}`}
-                        >
-                          <X className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              <div className="pt-1 flex flex-wrap items-center justify-between gap-3">
-                <button
-                  type="submit"
-                  disabled={creatingMeeting}
-                  className="w-full sm:w-auto h-10 px-4 rounded-lg bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 disabled:opacity-50 text-white text-sm font-medium inline-flex items-center justify-center gap-2 transition-colors cursor-pointer whitespace-nowrap shrink-0"
-                >
-                  <Plus className="w-4 h-4" />
-                  <span>
-                    {creatingMeeting
-                      ? "Creating & Sending Invites..."
-                      : draftMembers.length > 0 || newMemberInput.trim()
-                      ? "Create Meeting & Send Link to Members"
-                      : "Create Meeting Link"}
-                  </span>
-                </button>
-              </div>
-
-              {creatorFeedback && (
-                <p
-                  className={`text-xs font-medium ${
-                    creatorFeedback.type === "success"
-                      ? "text-emerald-400"
-                      : "text-rose-400"
-                  }`}
-                >
-                  {creatorFeedback.text}
-                </p>
-              )}
-            </form>
-          </section>
-
-          {/* Right Column: Multiple Created Meetings List */}
-          <section className="lg:col-span-7 rounded-xl border border-slate-800 bg-slate-900/70 p-5">
-            <div className="flex items-center justify-between gap-4 mb-4">
-              <div>
-                <h2 className="text-base font-semibold text-white">
-                  Active & Created Meetings ({meetings.length})
-                </h2>
-                <p className="text-xs text-slate-400 mt-0.5">
-                  Create multiple meetings at the same time, add member emails, send links, or join any room.
-                </p>
-              </div>
-            </div>
-
-            {meetings.length === 0 ? (
-              <div className="rounded-lg border border-slate-800/80 bg-slate-950/50 p-6 text-center">
-                <p className="text-sm text-slate-300 font-medium">
-                  No meeting links created yet
-                </p>
-                <p className="text-xs text-slate-400 mt-1">
-                  Use the panel on the left to generate a meeting link, add member emails, and send invites. You can create multiple meetings simultaneously.
-                </p>
-              </div>
-            ) : (
-              <div className="space-y-3 max-h-[340px] overflow-y-auto pr-1">
-                {meetings.map((meeting) => {
-                  const isThisMeetingActive =
-                    isConnected && currentCleanRoom === meeting.roomCode;
-                  const fb = meetingFeedbackMap[meeting.id];
-
-                  return (
-                    <div
-                      key={meeting.id}
-                      className={`rounded-lg border p-4 transition-colors ${
-                        isThisMeetingActive
-                          ? "border-indigo-500/60 bg-indigo-950/20"
-                          : "border-slate-800 bg-slate-950/70"
-                      }`}
-                    >
-                      <div className="flex flex-wrap items-start justify-between gap-3">
-                        <div className="min-w-0">
-                          <div className="flex items-center gap-2">
-                            <h3 className="text-sm font-semibold text-white truncate">
-                              {meeting.title}
-                            </h3>
-                            <span aria-hidden="true" className="text-slate-600">
-                              ·
-                            </span>
-                            <span className="text-xs font-mono text-indigo-300 tabular-nums">
-                              {meeting.roomCode}
-                            </span>
-                            <span aria-hidden="true" className="text-slate-600">
-                              ·
-                            </span>
-                            <span className="text-xs text-slate-500 font-mono tabular-nums">
-                              {meeting.createdAt}
-                            </span>
-                          </div>
-                          <div className="text-xs text-slate-400 font-mono truncate mt-1">
-                            {buildMeetingLink(meeting.roomCode)}
-                          </div>
-                        </div>
-
-                        <div className="flex items-center gap-2 shrink-0">
-                          <button
-                            type="button"
-                            onClick={() => handleCopyLinkForRoom(meeting.roomCode)}
-                            className="h-8 px-3 rounded-lg border border-slate-800 bg-slate-900 hover:bg-slate-800 text-slate-200 text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
-                          >
-                            {copiedRoomCode === meeting.roomCode ? (
-                              <>
-                                <Check className="w-3.5 h-3.5 text-emerald-400" />
-                                <span>Link Copied</span>
-                              </>
-                            ) : (
-                              <>
-                                <Copy className="w-3.5 h-3.5 text-slate-400" />
-                                <span>Copy Link</span>
-                              </>
-                            )}
-                          </button>
-
-                          <button
-                            type="button"
-                            onClick={() => void joinRoomByCode(meeting.roomCode)}
-                            disabled={isJoining || isThisMeetingActive}
-                            className={`h-8 px-3.5 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer disabled:cursor-not-allowed whitespace-nowrap shrink-0 ${
-                              isThisMeetingActive
-                                ? "bg-emerald-600/20 border border-emerald-500/40 text-emerald-300"
-                                : "bg-indigo-600 hover:bg-indigo-500 text-white"
-                            }`}
-                          >
-                            <LogIn className="w-3.5 h-3.5" />
-                            <span>
-                              {isThisMeetingActive
-                                ? "Connected"
-                                : isConnected
-                                ? "Switch Room"
-                                : "Join"}
-                            </span>
-                          </button>
-
-                          <button
-                            type="button"
-                            onClick={() => handleDeleteMeeting(meeting.id)}
-                            className="h-8 w-8 rounded-lg border border-slate-800 bg-slate-900 hover:bg-rose-950/50 hover:border-rose-500/40 text-slate-400 hover:text-rose-300 inline-flex items-center justify-center cursor-pointer shrink-0"
-                            title="Remove meeting"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
-                      </div>
-
-                      {/* Members list for this meeting */}
-                      <div className="mt-3 pt-3 border-t border-slate-800/80 space-y-2">
-                        {meeting.members.length > 0 && (
-                          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
-                            <span className="text-slate-400 font-medium">
-                              Members:
-                            </span>
-                            {meeting.members.map((mem, i) => (
-                              <React.Fragment key={mem.email}>
-                                {i > 0 && (
-                                  <span
-                                    aria-hidden="true"
-                                    className="text-slate-700"
-                                  >
-                                    ·
-                                  </span>
-                                )}
-                                <span className="inline-flex items-center gap-1">
-                                  <span className="text-slate-200">
-                                    {mem.email}
-                                  </span>
-                                  <span
-                                    className={
-                                      mem.status === "sent"
-                                        ? "text-emerald-400"
-                                        : mem.status === "error"
-                                        ? "text-rose-400"
-                                        : "text-amber-400"
-                                    }
-                                    title={mem.errorMessage}
-                                  >
-                                    (
-                                    {mem.status === "sent"
-                                      ? "Invite sent"
-                                      : mem.status === "sending"
-                                      ? "Sending..."
-                                      : "Failed"}
-                                    )
-                                  </span>
-                                </span>
-                              </React.Fragment>
-                            ))}
-                          </div>
-                        )}
-
-                        {/* Add & send invite to more members for this meeting */}
-                        <form
-                          onSubmit={(e) =>
-                            void handleInviteMemberToExistingMeeting(meeting, e)
-                          }
-                          className="flex flex-wrap items-center gap-2"
-                        >
-                          <input
-                            type="text"
-                            value={meetingMemberInputs[meeting.id] || ""}
-                            onChange={(e) =>
-                              setMeetingMemberInputs((prev) => ({
-                                ...prev,
-                                [meeting.id]: e.target.value,
-                              }))
-                            }
-                            placeholder="Add member email(s) to send link..."
-                            className="flex-1 min-w-[200px] h-8 px-2.5 rounded-md bg-slate-900 border border-slate-800 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500"
-                          />
-                          <button
-                            type="submit"
-                            className="h-8 px-3 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
-                          >
-                            <Send className="w-3 h-3" />
-                            <span>Send Link</span>
-                          </button>
-                          {fb && (
-                            <span
-                              className={`text-xs font-medium ${
-                                fb.type === "success"
-                                  ? "text-emerald-400"
-                                  : "text-rose-400"
-                              }`}
-                            >
-                              {fb.text}
-                            </span>
-                          )}
-                        </form>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </section>
-        </div>
-
-        {/* Active Meeting Session Controls: Join via Link/Code, Your Name, Join/Leave, Mic/Camera, Quick Email Invite */}
-        <section className="rounded-xl border border-slate-800 bg-slate-900/70 p-4 sm:p-5">
-          <form
-            onSubmit={handleJoin}
-            className="flex flex-col lg:flex-row lg:items-end justify-between gap-4"
-          >
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 flex-1 max-w-xl">
-              <div>
-                <label
-                  htmlFor="room-name-input"
-                  className="block text-xs font-medium text-slate-300 mb-1.5"
-                >
-                  Meeting link or code
-                </label>
-                <input
-                  id="room-name-input"
-                  type="text"
-                  value={roomName}
-                  onChange={(e) => setRoomName(e.target.value)}
-                  disabled={isBusyOrConnected}
-                  placeholder="Paste meeting link or code"
-                  className="w-full h-10 px-3.5 rounded-lg bg-slate-950 border border-slate-800 text-sm font-mono text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
-                />
-              </div>
-
-              <div>
-                <label
-                  htmlFor="your-name-input"
-                  className="block text-xs font-medium text-slate-300 mb-1.5"
-                >
-                  Your name
-                </label>
-                <input
-                  id="your-name-input"
-                  type="text"
-                  value={userName}
-                  onChange={(e) => setUserName(e.target.value)}
-                  disabled={isBusyOrConnected}
-                  placeholder="guest"
-                  className="w-full h-10 px-3.5 rounded-lg bg-slate-950 border border-slate-800 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
-                />
-              </div>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2.5">
-              {/* Join & Leave Buttons */}
-              <button
-                type="submit"
-                disabled={isBusyOrConnected}
-                className="h-10 px-5 rounded-lg bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 disabled:bg-slate-800 disabled:text-slate-500 text-white text-sm font-medium inline-flex items-center gap-2 transition-colors cursor-pointer disabled:cursor-not-allowed whitespace-nowrap shrink-0"
-              >
-                <LogIn className="w-4 h-4" />
-                <span>{isJoining ? "Joining..." : "Join"}</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={handleLeave}
-                disabled={!isBusyOrConnected}
-                className="h-10 px-4 rounded-lg bg-rose-600/90 hover:bg-rose-500 active:bg-rose-700 disabled:bg-slate-800/70 disabled:text-slate-500 text-white text-sm font-medium inline-flex items-center gap-2 transition-colors cursor-pointer disabled:cursor-not-allowed whitespace-nowrap shrink-0"
-              >
-                <PhoneOff className="w-4 h-4" />
-                <span>Leave</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => handleCopyLinkForRoom(roomName)}
-                title="Copy shareable meeting link"
-                className="h-10 px-3.5 rounded-lg border border-slate-800 bg-slate-950 hover:bg-slate-800 text-slate-200 text-sm font-medium inline-flex items-center gap-2 transition-colors cursor-pointer whitespace-nowrap shrink-0"
-              >
-                {copiedRoomCode === currentCleanRoom ? (
-                  <>
-                    <Check className="w-4 h-4 text-emerald-400" />
-                    <span>Invite Copied</span>
-                  </>
-                ) : (
-                  <>
-                    <Copy className="w-4 h-4 text-slate-400" />
-                    <span>Copy Invite Link</span>
-                  </>
-                )}
-              </button>
-
-              <div
-                className="hidden sm:block h-6 w-px bg-slate-800 mx-1"
-                aria-hidden="true"
-              />
-
-              {/* Mic Mute/Unmute & Camera On/Off */}
-              <button
-                type="button"
-                onClick={handleToggleMute}
-                disabled={!isConnected}
-                aria-pressed={isMuted}
-                className={`h-10 px-4 rounded-lg border text-sm font-medium inline-flex items-center gap-2 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap shrink-0 ${
-                  isMuted
-                    ? "bg-amber-500/15 border-amber-500/40 text-amber-300 hover:bg-amber-500/25"
-                    : "bg-slate-950 border-slate-800 text-slate-200 hover:bg-slate-800"
-                }`}
-              >
-                {isMuted ? (
-                  <>
-                    <MicOff className="w-4 h-4 text-amber-400" />
-                    <span>Unmute Mic</span>
-                  </>
-                ) : (
-                  <>
-                    <Mic className="w-4 h-4 text-emerald-400" />
-                    <span>Mute Mic</span>
-                  </>
-                )}
-              </button>
-
-              <button
-                type="button"
-                onClick={handleToggleCamera}
-                disabled={!isConnected}
-                aria-pressed={!isCameraOn}
-                className={`h-10 px-4 rounded-lg border text-sm font-medium inline-flex items-center gap-2 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap shrink-0 ${
-                  !isCameraOn
-                    ? "bg-amber-500/15 border-amber-500/40 text-amber-300 hover:bg-amber-500/25"
-                    : "bg-slate-950 border-slate-800 text-slate-200 hover:bg-slate-800"
-                }`}
-              >
-                {isCameraOn ? (
-                  <>
-                    <Camera className="w-4 h-4 text-emerald-400" />
-                    <span>Camera Off</span>
-                  </>
-                ) : (
-                  <>
-                    <CameraOff className="w-4 h-4 text-amber-400" />
-                    <span>Camera On</span>
-                  </>
-                )}
-              </button>
-            </div>
-          </form>
-
-          {/* Active room roster line */}
-          {isConnected && attendeeList.length > 0 && (
-            <div className="mt-3 pt-3 border-t border-slate-800/80 flex flex-wrap items-center gap-2 text-xs text-slate-400">
-              <span className="font-medium text-slate-300">
-                In this room ({currentCleanRoom}):
-              </span>
-              {attendeeList.map((att, idx) => (
-                <React.Fragment key={att.attendeeId}>
-                  {idx > 0 && <span aria-hidden="true">·</span>}
-                  <span className="text-slate-200">{att.label}</span>
-                </React.Fragment>
-              ))}
-            </div>
-          )}
-
-          {/* Direct Invite by email section */}
-          <div className="mt-4 pt-4 border-t border-slate-800/80">
-            <form
-              onSubmit={handleSendInvite}
-              className="flex flex-col sm:flex-row sm:items-center gap-3"
-            >
-              <label
-                htmlFor="invite-email-input"
-                className="text-xs font-medium text-slate-300 flex items-center gap-1.5 whitespace-nowrap shrink-0"
-              >
-                <Mail className="w-3.5 h-3.5 text-slate-400" />
-                <span>Invite by email ({currentCleanRoom})</span>
-              </label>
-              <div className="flex flex-1 items-center gap-2.5 max-w-md">
-                <input
-                  id="invite-email-input"
-                  type="email"
-                  value={inviteEmail}
-                  onChange={(e) => {
-                    setInviteEmail(e.target.value);
-                    if (inviteSuccess) setInviteSuccess("");
-                    if (inviteError) setInviteError("");
-                  }}
-                  placeholder="colleague@example.com"
-                  className="flex-1 h-9 px-3 rounded-lg bg-slate-950 border border-slate-800 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-colors"
-                />
-                <button
-                  type="submit"
-                  disabled={inviteSending}
-                  className="h-9 px-4 rounded-lg bg-slate-800 hover:bg-slate-700 active:bg-slate-800 disabled:opacity-50 text-slate-100 text-xs font-medium inline-flex items-center gap-1.5 transition-colors cursor-pointer disabled:cursor-not-allowed whitespace-nowrap shrink-0"
-                >
-                  <Send className="w-3.5 h-3.5" />
-                  <span>{inviteSending ? "Sending..." : "Send invite"}</span>
-                </button>
-              </div>
-              {inviteSuccess && (
-                <span className="text-xs font-medium text-emerald-400">
-                  {inviteSuccess}
-                </span>
-              )}
-              {inviteError && (
-                <span className="text-xs font-medium text-rose-400">
-                  {inviteError}
-                </span>
-              )}
-            </form>
-          </div>
-        </section>
-
         {/* Clearly visible error box showing full error text */}
         {errorText && (
           <section
@@ -1643,82 +1198,753 @@ export default function App() {
           </section>
         )}
 
-        {/* Responsive Video Grid (up to 4 tiles) */}
-        <section className="flex-1 flex flex-col">
-          {tiles.length === 0 ? (
-            <div className="flex-1 min-h-[380px] rounded-xl border border-slate-800/80 bg-slate-900/30 flex flex-col items-center justify-center p-8 text-center">
-              <div className="w-12 h-12 rounded-xl bg-slate-900 border border-slate-800 flex items-center justify-center text-slate-400 mb-4">
-                <Video className="w-6 h-6" />
-              </div>
-              <h2 className="text-base font-semibold text-slate-200 mb-1">
-                {status === "Joining"
-                  ? "Connecting to meeting..."
-                  : status === "Connected"
-                  ? `Connected to "${currentCleanRoom}" (${
-                      attendeeList.length
-                    } participant${attendeeList.length === 1 ? "" : "s"} in audio)`
-                  : "Ready to start or join a meeting"}
-              </h2>
-              <p className="text-sm text-slate-400 max-w-md">
-                {status === "Joining"
-                  ? "Initializing Amazon Chime session and starting your camera and microphone."
-                  : status === "Connected"
-                  ? "Audio is active. Turn on a camera to display video tiles."
-                  : "Create one or more meeting links above, add member emails to send them the invite link automatically, and click Join on any meeting."}
-              </p>
-            </div>
-          ) : (
-            <div
-              className={`grid ${gridColsClass} gap-4 flex-1 auto-rows-fr w-full`}
-            >
-              {tiles.map((tile) => (
-                <div
-                  key={tile.tileId}
-                  className="relative aspect-video rounded-xl overflow-hidden bg-slate-900 border border-slate-800 shadow-sm flex items-center justify-center"
+        {/* Active Meeting Room Stage (shown at the top when joining/connected or when opened via ?room= link) */}
+        <div
+          ref={meetingStageRef}
+          className={`flex flex-col gap-4 ${
+            inMeetingView || isBusyOrConnected ? "order-1" : "order-2"
+          }`}
+        >
+          <section className="rounded-xl border border-slate-800 bg-slate-900/80 p-5 flex flex-col gap-4">
+            {/* Active Room Control Bar */}
+            <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800/80 pb-4">
+              <div className="flex flex-wrap items-center gap-3">
+                <span className="text-sm font-semibold text-white">
+                  Meeting Room:{" "}
+                  <span className="font-mono text-indigo-300">
+                    {currentCleanRoom}
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => handleCopyLinkForRoom(currentCleanRoom)}
+                  className="h-8 px-3 rounded-lg border border-slate-800 bg-slate-950 hover:bg-slate-800 text-slate-200 text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
                 >
-                  <video
-                    ref={(el) => {
-                      if (el) {
-                        videoElementsMapRef.current.set(tile.tileId, el);
-                        if (audioVideoRef.current) {
-                          audioVideoRef.current.bindVideoElement(
-                            tile.tileId,
-                            el
-                          );
-                        }
-                      } else {
-                        videoElementsMapRef.current.delete(tile.tileId);
-                      }
-                    }}
-                    autoPlay
-                    playsInline
-                    muted={tile.isLocal}
-                    className="w-full h-full object-cover bg-slate-950"
-                  />
+                  {copiedRoomCode === currentCleanRoom ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Link Copied</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5 text-slate-400" />
+                      <span>Copy Meeting Link</span>
+                    </>
+                  )}
+                </button>
+              </div>
 
-                  {/* Bottom scrim and attendee label */}
-                  <div
-                    className="
-                    absolute inset-x-0 bottom-0 p-3
-                    bg-gradient-to-t from-black/80 via-black/40 to-transparent
-                    flex items-center justify-between gap-2 pointer-events-none
-                  "
+              {/* Audio / Video / Join / Leave Controls */}
+              <div className="flex flex-wrap items-center gap-2.5">
+                {!isConnected && (
+                  <button
+                    type="button"
+                    onClick={() => void handleJoin()}
+                    disabled={isJoining}
+                    className="h-9 px-4 rounded-lg bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 disabled:bg-slate-800 disabled:text-slate-500 text-white text-xs font-medium inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0"
                   >
-                    <span className="text-sm font-medium text-white truncate">
-                      {tile.isLocal ? "You" : tile.label}
-                    </span>
-                    {tile.isLocal && isMuted && (
-                      <span className="text-xs text-amber-300 flex items-center gap-1">
-                        <MicOff className="w-3.5 h-3.5" />
-                        <span>Muted</span>
+                    <LogIn className="w-3.5 h-3.5" />
+                    <span>{isJoining ? "Joining Room..." : "Join Room Now"}</span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => void handleToggleMute()}
+                  disabled={!isConnected}
+                  aria-pressed={isMuted}
+                  className={`h-9 px-3.5 rounded-lg border text-xs font-medium inline-flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap shrink-0 ${
+                    isMuted
+                      ? "bg-amber-500/15 border-amber-500/40 text-amber-300 hover:bg-amber-500/25"
+                      : "bg-slate-950 border-slate-800 text-slate-200 hover:bg-slate-800"
+                  }`}
+                >
+                  {isMuted ? (
+                    <>
+                      <MicOff className="w-3.5 h-3.5 text-amber-400" />
+                      <span>Unmute Mic</span>
+                    </>
+                  ) : (
+                    <>
+                      <Mic className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Mute Mic</span>
+                    </>
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => void handleToggleCamera()}
+                  disabled={!isConnected}
+                  aria-pressed={!isCameraOn}
+                  className={`h-9 px-3.5 rounded-lg border text-xs font-medium inline-flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap shrink-0 ${
+                    !isCameraOn
+                      ? "bg-amber-500/15 border-amber-500/40 text-amber-300 hover:bg-amber-500/25"
+                      : "bg-slate-950 border-slate-800 text-slate-200 hover:bg-slate-800"
+                  }`}
+                >
+                  {isCameraOn ? (
+                    <>
+                      <Camera className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Camera Off</span>
+                    </>
+                  ) : (
+                    <>
+                      <CameraOff className="w-3.5 h-3.5 text-amber-400" />
+                      <span>Camera On</span>
+                    </>
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => void handleLeave()}
+                  disabled={!isBusyOrConnected}
+                  className="h-9 px-4 rounded-lg bg-rose-600/90 hover:bg-rose-500 active:bg-rose-700 disabled:bg-slate-800/70 disabled:text-slate-500 text-white text-xs font-medium inline-flex items-center gap-1.5 transition-colors cursor-pointer disabled:cursor-not-allowed whitespace-nowrap shrink-0"
+                >
+                  <PhoneOff className="w-3.5 h-3.5" />
+                  <span>Leave</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Active participants roster */}
+            {isConnected && attendeeList.length > 0 && (
+              <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+                <span className="font-medium text-slate-300">
+                  Participants in room ({attendeeList.length}):
+                </span>
+                {attendeeList.map((att, idx) => (
+                  <React.Fragment key={att.attendeeId}>
+                    {idx > 0 && <span aria-hidden="true">·</span>}
+                    <span className="text-slate-200">{att.label}</span>
+                  </React.Fragment>
+                ))}
+              </div>
+            )}
+
+            {/* Responsive Video Grid (up to 4 tiles) */}
+            {tiles.length === 0 ? (
+              <div className="min-h-[340px] rounded-xl border border-slate-800/80 bg-slate-950/60 flex flex-col items-center justify-center p-8 text-center">
+                <div className="w-12 h-12 rounded-xl bg-slate-900 border border-slate-800 flex items-center justify-center text-indigo-400 mb-4">
+                  <Video className="w-6 h-6" />
+                </div>
+                <h2 className="text-base font-semibold text-slate-200 mb-1">
+                  {status === "Joining"
+                    ? `Joining meeting room "${currentCleanRoom}"...`
+                    : status === "Connected"
+                    ? `Connected to "${currentCleanRoom}" (${
+                        attendeeList.length
+                      } participant${attendeeList.length === 1 ? "" : "s"} in room)`
+                    : `Meeting Room: ${currentCleanRoom}`}
+                </h2>
+                <p className="text-sm text-slate-400 max-w-md mb-4">
+                  {status === "Joining"
+                    ? "Connecting to Amazon Chime audio & video session..."
+                    : status === "Connected"
+                    ? "You are in the meeting room with audio active. Click 'Camera On' above to turn on your video tile."
+                    : "Click 'Join Room Now' to connect your microphone and camera to this room."}
+                </p>
+                {!isConnected && !isJoining && (
+                  <button
+                    type="button"
+                    onClick={() => void handleJoin()}
+                    className="h-10 px-5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium inline-flex items-center gap-2 cursor-pointer"
+                  >
+                    <LogIn className="w-4 h-4" />
+                    <span>Join Room Now ({currentCleanRoom})</span>
+                  </button>
+                )}
+              </div>
+            ) : (
+              <div
+                className={`grid ${gridColsClass} gap-4 auto-rows-fr w-full`}
+              >
+                {tiles.map((tile) => (
+                  <div
+                    key={tile.tileId}
+                    className="relative aspect-video rounded-xl overflow-hidden bg-slate-950 border border-slate-800 shadow-sm flex items-center justify-center"
+                  >
+                    <video
+                      ref={(el) => {
+                        if (el) {
+                          videoElementsMapRef.current.set(tile.tileId, el);
+                          if (audioVideoRef.current) {
+                            audioVideoRef.current.bindVideoElement(
+                              tile.tileId,
+                              el
+                            );
+                          }
+                        } else {
+                          videoElementsMapRef.current.delete(tile.tileId);
+                        }
+                      }}
+                      autoPlay
+                      playsInline
+                      muted={tile.isLocal}
+                      className="w-full h-full object-cover bg-slate-950"
+                    />
+
+                    {/* Bottom scrim and attendee label */}
+                    <div
+                      className="
+                      absolute inset-x-0 bottom-0 p-3
+                      bg-gradient-to-t from-black/80 via-black/40 to-transparent
+                      flex items-center justify-between gap-2 pointer-events-none
+                    "
+                    >
+                      <span className="text-sm font-medium text-white truncate">
+                        {tile.isLocal ? "You" : tile.label}
                       </span>
-                    )}
+                      {tile.isLocal && isMuted && (
+                        <span className="text-xs text-amber-300 flex items-center gap-1">
+                          <MicOff className="w-3.5 h-3.5" />
+                          <span>Muted</span>
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Invite by email bar inside room */}
+            <div className="pt-3 border-t border-slate-800/80">
+              <form
+                onSubmit={handleSendInvite}
+                className="flex flex-col sm:flex-row sm:items-center gap-3"
+              >
+                <label
+                  htmlFor="invite-email-input"
+                  className="text-xs font-medium text-slate-300 flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                >
+                  <Mail className="w-3.5 h-3.5 text-slate-400" />
+                  <span>Invite by email</span>
+                </label>
+                <div className="flex flex-1 items-center gap-2.5 max-w-md">
+                  <input
+                    id="invite-email-input"
+                    type="email"
+                    value={inviteEmail}
+                    onChange={(e) => {
+                      setInviteEmail(e.target.value);
+                      if (inviteSuccess) setInviteSuccess("");
+                      if (inviteError) setInviteError("");
+                    }}
+                    placeholder="colleague@example.com"
+                    className="flex-1 h-9 px-3 rounded-lg bg-slate-950 border border-slate-800 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-colors"
+                  />
+                  <button
+                    type="submit"
+                    disabled={inviteSending}
+                    className="h-9 px-4 rounded-lg bg-slate-800 hover:bg-slate-700 active:bg-slate-800 disabled:opacity-50 text-slate-100 text-xs font-medium inline-flex items-center gap-1.5 transition-colors cursor-pointer disabled:cursor-not-allowed whitespace-nowrap shrink-0"
+                  >
+                    <Send className="w-3.5 h-3.5" />
+                    <span>{inviteSending ? "Sending..." : "Send invite"}</span>
+                  </button>
+                </div>
+                {inviteSuccess && (
+                  <span className="text-xs font-medium text-emerald-400">
+                    {inviteSuccess}
+                  </span>
+                )}
+                {inviteError && (
+                  <span className="text-xs font-medium text-rose-400">
+                    {inviteError}
+                  </span>
+                )}
+              </form>
+            </div>
+          </section>
+        </div>
+
+        {/* UNIFIED SECTION: Instant Meeting, Join by Link/Code, and Create/Schedule Meeting Links */}
+        <div
+          className={`flex flex-col gap-6 ${
+            inMeetingView || isBusyOrConnected ? "order-2" : "order-1"
+          }`}
+        >
+          <section className="rounded-xl border border-slate-800 bg-slate-900/70 p-5 sm:p-6 space-y-6">
+            {/* Top row of Unified Section: Display Name + Instant Meeting + Join by Link/Code */}
+            <div>
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
+                <div>
+                  <h2 className="text-base font-semibold text-white">
+                    Meetings Hub — Instant Join & Create Meeting Links
+                  </h2>
+                  <p className="text-xs text-slate-400 mt-0.5">
+                    Start an instant meeting, join with a meeting link/code, or schedule multiple meeting links and invite members by email.
+                  </p>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-end">
+                {/* Your Name */}
+                <div className="lg:col-span-3">
+                  <label
+                    htmlFor="your-name-input"
+                    className="block text-xs font-medium text-slate-300 mb-1.5"
+                  >
+                    Your name
+                  </label>
+                  <input
+                    id="your-name-input"
+                    type="text"
+                    value={userName}
+                    onChange={(e) => setUserName(e.target.value)}
+                    placeholder="guest"
+                    className="w-full h-10 px-3.5 rounded-lg bg-slate-950 border border-slate-800 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-colors"
+                  />
+                </div>
+
+                {/* Instant Meeting Button */}
+                <div className="lg:col-span-3">
+                  <button
+                    type="button"
+                    onClick={() => void handleStartInstantMeeting()}
+                    disabled={isJoining}
+                    className="w-full h-10 px-4 rounded-lg bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 disabled:opacity-50 text-white text-sm font-medium inline-flex items-center justify-center gap-2 transition-colors cursor-pointer whitespace-nowrap"
+                  >
+                    <Zap className="w-4 h-4" />
+                    <span>Start Instant Meeting</span>
+                  </button>
+                </div>
+
+                {/* Join with Meeting Link or Room Code */}
+                <form
+                  onSubmit={handleJoin}
+                  className="lg:col-span-6 flex items-end gap-2.5"
+                >
+                  <div className="flex-1">
+                    <label
+                      htmlFor="room-name-input"
+                      className="block text-xs font-medium text-slate-300 mb-1.5"
+                    >
+                      Room name or meeting link
+                    </label>
+                    <input
+                      id="room-name-input"
+                      type="text"
+                      value={roomName}
+                      onChange={(e) => setRoomName(e.target.value)}
+                      placeholder="Paste meeting link (?room=...) or room code"
+                      className="w-full h-10 px-3.5 rounded-lg bg-slate-950 border border-slate-800 text-sm font-mono text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-colors"
+                    />
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={isJoining}
+                    className="h-10 px-5 rounded-lg bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 disabled:opacity-50 text-white text-sm font-medium inline-flex items-center gap-2 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                  >
+                    <LogIn className="w-4 h-4" />
+                    <span>{isJoining ? "Joining..." : "Join"}</span>
+                  </button>
+                </form>
+              </div>
+            </div>
+
+            {/* Divider inside the single unified section */}
+            <div className="border-t border-slate-800/80 pt-5">
+              <div className="flex items-center gap-2 mb-4">
+                <CalendarPlus className="w-4 h-4 text-indigo-400" />
+                <h3 className="text-sm font-semibold text-white">
+                  Create & Schedule Meeting Link (Add Member Emails)
+                </h3>
+              </div>
+
+              <form
+                onSubmit={(e) => void handleCreateMeeting(e, false)}
+                className="space-y-4"
+              >
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  {/* Meeting Title */}
+                  <div>
+                    <label
+                      htmlFor="new-meeting-title"
+                      className="block text-xs font-medium text-slate-300 mb-1.5"
+                    >
+                      Meeting title
+                    </label>
+                    <input
+                      id="new-meeting-title"
+                      type="text"
+                      value={newMeetingTitle}
+                      onChange={(e) => setNewMeetingTitle(e.target.value)}
+                      placeholder="e.g. Design Review, Team Sync"
+                      className="w-full h-10 px-3 rounded-lg bg-slate-950 border border-slate-800 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-colors"
+                    />
+                  </div>
+
+                  {/* Schedule Date & Time */}
+                  <div>
+                    <label
+                      htmlFor="new-meeting-time"
+                      className="block text-xs font-medium text-slate-300 mb-1.5"
+                    >
+                      Schedule date & time (optional)
+                    </label>
+                    <div className="relative">
+                      <input
+                        id="new-meeting-time"
+                        type="datetime-local"
+                        value={newMeetingTime}
+                        onChange={(e) => setNewMeetingTime(e.target.value)}
+                        className="w-full h-10 px-3 rounded-lg bg-slate-950 border border-slate-800 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-colors [color-scheme:dark]"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Auto-generated Meeting Link Preview */}
+                  <div>
+                    <div className="flex items-center justify-between mb-1.5">
+                      <label className="block text-xs font-medium text-slate-300">
+                        Generated meeting link
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() => setNewMeetingCode(generateMeetingCode())}
+                        className="text-xs text-indigo-400 hover:text-indigo-300 inline-flex items-center gap-1 cursor-pointer"
+                      >
+                        <RefreshCw className="w-3 h-3" />
+                        <span>Regenerate</span>
+                      </button>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <div className="flex-1 h-10 px-3 rounded-lg bg-slate-950 border border-slate-800 flex items-center gap-2 min-w-0">
+                        <Link2 className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                        <span className="text-xs font-mono text-slate-200 truncate">
+                          {buildMeetingLink(newMeetingCode)}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleCopyLinkForRoom(newMeetingCode)}
+                        className="h-10 px-3 rounded-lg border border-slate-800 bg-slate-950 hover:bg-slate-800 text-slate-200 text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
+                      >
+                        {copiedRoomCode === newMeetingCode ? (
+                          <>
+                            <Check className="w-3.5 h-3.5 text-emerald-400" />
+                            <span>Copied</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3.5 h-3.5 text-slate-400" />
+                            <span>Copy</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
                   </div>
                 </div>
-              ))}
+
+                {/* Add Member Emails & Create Buttons */}
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
+                  <div className="lg:col-span-7">
+                    <label
+                      htmlFor="add-member-email"
+                      className="block text-xs font-medium text-slate-300 mb-1.5"
+                    >
+                      Add member emails to receive the meeting link
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <input
+                        id="add-member-email"
+                        type="text"
+                        value={newMemberInput}
+                        onChange={(e) => {
+                          setNewMemberInput(e.target.value);
+                          if (creatorFeedback) setCreatorFeedback(null);
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.preventDefault();
+                            handleAddDraftMember();
+                          }
+                        }}
+                        placeholder="alice@example.com, bob@example.com"
+                        className="flex-1 h-10 px-3 rounded-lg bg-slate-950 border border-slate-800 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-colors"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleAddDraftMember}
+                        className="h-10 px-3.5 rounded-lg border border-slate-800 bg-slate-950 hover:bg-slate-800 text-slate-200 text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
+                      >
+                        <UserPlus className="w-3.5 h-3.5 text-indigo-400" />
+                        <span>Add Member</span>
+                      </button>
+                    </div>
+
+                    {draftMembers.length > 0 && (
+                      <div className="mt-2.5 flex flex-wrap gap-1.5">
+                        {draftMembers.map((email) => (
+                          <div
+                            key={email}
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-950 border border-slate-800 text-xs text-slate-200"
+                          >
+                            <Mail className="w-3 h-3 text-slate-400" />
+                            <span>{email}</span>
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveDraftMember(email)}
+                              className="text-slate-500 hover:text-rose-400 cursor-pointer"
+                              aria-label={`Remove ${email}`}
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="lg:col-span-5 flex flex-wrap items-center lg:justify-end gap-2.5 lg:pt-6">
+                    <button
+                      type="submit"
+                      disabled={creatingMeeting}
+                      className="h-10 px-4 rounded-lg bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 disabled:opacity-50 text-white text-xs sm:text-sm font-medium inline-flex items-center gap-2 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                    >
+                      <Plus className="w-4 h-4" />
+                      <span>
+                        {creatingMeeting
+                          ? "Creating & Sending..."
+                          : "Create & Send Link"}
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={creatingMeeting}
+                      onClick={(e) => void handleCreateMeeting(e, true)}
+                      className="h-10 px-4 rounded-lg border border-indigo-500/40 bg-indigo-950/40 hover:bg-indigo-900/50 text-indigo-200 text-xs sm:text-sm font-medium inline-flex items-center gap-2 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                    >
+                      <LogIn className="w-4 h-4" />
+                      <span>Create, Send & Join Now</span>
+                    </button>
+                  </div>
+                </div>
+
+                {creatorFeedback && (
+                  <p
+                    className={`text-xs font-medium ${
+                      creatorFeedback.type === "success"
+                        ? "text-emerald-400"
+                        : "text-rose-400"
+                    }`}
+                  >
+                    {creatorFeedback.text}
+                  </p>
+                )}
+              </form>
             </div>
-          )}
-        </section>
+
+            {/* Multiple Created & Scheduled Meetings List inside the same unified hub */}
+            {meetings.length > 0 && (
+              <div className="border-t border-slate-800/80 pt-5">
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className="text-sm font-semibold text-white">
+                    Your Scheduled & Created Meetings ({meetings.length})
+                  </h3>
+                  <span className="text-xs text-slate-400">
+                    Click Join on any meeting to enter its room
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  {meetings.map((meeting) => {
+                    const isThisMeetingActive =
+                      isConnected && currentCleanRoom === meeting.roomCode;
+                    const fb = meetingFeedbackMap[meeting.id];
+
+                    return (
+                      <div
+                        key={meeting.id}
+                        className={`rounded-lg border p-4 flex flex-col justify-between gap-3 transition-colors ${
+                          isThisMeetingActive
+                            ? "border-indigo-500/60 bg-indigo-950/20"
+                            : "border-slate-800 bg-slate-950/70"
+                        }`}
+                      >
+                        <div>
+                          <div className="flex flex-wrap items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <h4 className="text-sm font-semibold text-white truncate">
+                                  {meeting.title}
+                                </h4>
+                                <span
+                                  aria-hidden="true"
+                                  className="text-slate-600"
+                                >
+                                  ·
+                                </span>
+                                <span className="text-xs font-mono text-indigo-300 tabular-nums">
+                                  {meeting.roomCode}
+                                </span>
+                              </div>
+
+                              <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400 mt-1">
+                                <span className="inline-flex items-center gap-1 text-slate-300">
+                                  {meeting.scheduledTime ? (
+                                    <Calendar className="w-3.5 h-3.5 text-indigo-400" />
+                                  ) : (
+                                    <Clock className="w-3.5 h-3.5 text-slate-400" />
+                                  )}
+                                  <span className="tabular-nums">
+                                    {formatScheduledTime(meeting.scheduledTime)}
+                                  </span>
+                                </span>
+                              </div>
+
+                              <div className="text-xs text-slate-500 font-mono truncate mt-1">
+                                {buildMeetingLink(meeting.roomCode)}
+                              </div>
+                            </div>
+
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  handleCopyLinkForRoom(meeting.roomCode)
+                                }
+                                className="h-8 px-2.5 rounded-lg border border-slate-800 bg-slate-900 hover:bg-slate-800 text-slate-200 text-xs font-medium inline-flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                              >
+                                {copiedRoomCode === meeting.roomCode ? (
+                                  <>
+                                    <Check className="w-3.5 h-3.5 text-emerald-400" />
+                                    <span>Copied</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <Copy className="w-3.5 h-3.5 text-slate-400" />
+                                    <span>Copy Link</span>
+                                  </>
+                                )}
+                              </button>
+
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void joinRoomByCode(meeting.roomCode)
+                                }
+                                disabled={isJoining || isThisMeetingActive}
+                                className={`h-8 px-3 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer disabled:cursor-not-allowed whitespace-nowrap ${
+                                  isThisMeetingActive
+                                    ? "bg-emerald-600/20 border border-emerald-500/40 text-emerald-300"
+                                    : "bg-indigo-600 hover:bg-indigo-500 text-white"
+                                }`}
+                              >
+                                <LogIn className="w-3.5 h-3.5" />
+                                <span>
+                                  {isThisMeetingActive
+                                    ? "In Room"
+                                    : isConnected
+                                    ? "Switch Room"
+                                    : "Join Room"}
+                                </span>
+                              </button>
+
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteMeeting(meeting.id)}
+                                className="h-8 w-8 rounded-lg border border-slate-800 bg-slate-900 hover:bg-rose-950/50 hover:border-rose-500/40 text-slate-400 hover:text-rose-300 inline-flex items-center justify-center cursor-pointer"
+                                title="Delete meeting"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Members list */}
+                          {meeting.members.length > 0 && (
+                            <div className="mt-2.5 pt-2.5 border-t border-slate-800/80 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs">
+                              <span className="text-slate-400 font-medium">
+                                Members:
+                              </span>
+                              {meeting.members.map((mem, i) => (
+                                <React.Fragment key={mem.email}>
+                                  {i > 0 && (
+                                    <span
+                                      aria-hidden="true"
+                                      className="text-slate-700"
+                                    >
+                                      ·
+                                    </span>
+                                  )}
+                                  <span className="inline-flex items-center gap-1">
+                                    <span className="text-slate-200">
+                                      {mem.email}
+                                    </span>
+                                    <span
+                                      className={
+                                        mem.status === "sent"
+                                          ? "text-emerald-400"
+                                          : mem.status === "error"
+                                          ? "text-rose-400"
+                                          : "text-amber-400"
+                                      }
+                                      title={mem.errorMessage}
+                                    >
+                                      (
+                                      {mem.status === "sent"
+                                        ? "Invite sent"
+                                        : mem.status === "sending"
+                                        ? "Sending..."
+                                        : "Failed"}
+                                      )
+                                    </span>
+                                  </span>
+                                </React.Fragment>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Add & invite more members to this scheduled meeting */}
+                        <form
+                          onSubmit={(e) =>
+                            void handleInviteMemberToExistingMeeting(meeting, e)
+                          }
+                          className="pt-2 border-t border-slate-800/60 flex flex-wrap items-center gap-2"
+                        >
+                          <input
+                            type="text"
+                            value={meetingMemberInputs[meeting.id] || ""}
+                            onChange={(e) =>
+                              setMeetingMemberInputs((prev) => ({
+                                ...prev,
+                                [meeting.id]: e.target.value,
+                              }))
+                            }
+                            placeholder="Add member email(s) to send link..."
+                            className="flex-1 min-w-[160px] h-8 px-2.5 rounded-md bg-slate-900 border border-slate-800 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500"
+                          />
+                          <button
+                            type="submit"
+                            className="h-8 px-3 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
+                          >
+                            <Send className="w-3 h-3" />
+                            <span>Send Link</span>
+                          </button>
+                          {fb && (
+                            <span
+                              className={`text-xs font-medium ${
+                                fb.type === "success"
+                                  ? "text-emerald-400"
+                                  : "text-rose-400"
+                              }`}
+                            >
+                              {fb.text}
+                            </span>
+                          )}
+                        </form>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </section>
+        </div>
       </main>
     </div>
   );
